@@ -99,26 +99,36 @@ void LeptonThread::useRangeMaxValue(uint16_t newMaxValue)
     autoRangeMax = false;
     rangeMax = newMaxValue;
 }
-
 void LeptonThread::run()
 {
-    // --- 1. NETWORK SETUP ---
+    // --- 1. NETWORK SETUP (TWO-WAY UDP) ---
     int sockfd;
-    struct sockaddr_in servaddr;
+    struct sockaddr_in servaddr, cliaddr;
     
     if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         std::cerr << "Socket creation failed" << std::endl;
     }
+
+    // FIX: Allow port reuse to prevent "Bind failed" errors
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT, &opt, sizeof(opt));
     
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
     servaddr.sin_port = htons(5005); 
-    servaddr.sin_addr.s_addr = inet_addr("127.0.0.1"); // Localhost
-    // ------------------------
+    servaddr.sin_addr.s_addr = INADDR_ANY; 
 
-    // Define the buffer for sending data (160x120 pixels)
+    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        std::cerr << "Socket bind failed" << std::endl;
+    }
+
+    struct sockaddr_in destaddr;
+    memset(&destaddr, 0, sizeof(destaddr));
+    destaddr.sin_family = AF_INET;
+    destaddr.sin_port = htons(5006);
+    destaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+
     std::vector<uint16_t> rawValuesBuffer(160 * 120, 0);
-
     myImage = QImage(myImageWidth, myImageHeight, QImage::Format_RGB888);
 
     const int *colormap = selectedColormap;
@@ -133,75 +143,66 @@ void LeptonThread::run()
     SpiOpenPort(0, spiSpeed);
 
     while(true) {
+        // --- UDP COMMAND LISTENER (CHECK 1) ---
+        char recvBuffer[32];
+        socklen_t len = sizeof(cliaddr);
+        if (recvfrom(sockfd, recvBuffer, sizeof(recvBuffer), MSG_DONTWAIT, (struct sockaddr *)&cliaddr, &len) > 0) {
+            if (std::string(recvBuffer).find("FFC") != std::string::npos) {
+                this->performFFC(); 
+            }
+        }
 
-        // --- 2. CAMERA READING LOOP (RESTORED) ---
+        // --- 2. CAMERA READING LOOP ---
         int resets = 0;
         int segmentNumber = -1;
         for(int j=0;j<PACKETS_PER_FRAME;j++) {
+            
+            // --- UDP COMMAND LISTENER (CHECK 2 - INSIDE PACKET LOOP) ---
+            if (j % 20 == 0) {
+                if (recvfrom(sockfd, recvBuffer, sizeof(recvBuffer), MSG_DONTWAIT, (struct sockaddr *)&cliaddr, &len) > 0) {
+                    if (std::string(recvBuffer).find("FFC") != std::string::npos) {
+                        this->performFFC(); 
+                    }
+                }
+            }
+
             read(spi_cs0_fd, result+sizeof(uint8_t)*PACKET_SIZE*j, sizeof(uint8_t)*PACKET_SIZE);
             int packetNumber = result[j*PACKET_SIZE+1];
             if(packetNumber != j) {
-                j = -1;
-                resets += 1;
-                usleep(1000);
+                j = -1; resets += 1; usleep(1000);
                 if(resets == 750) {
-                    SpiClosePort(0);
-                    lepton_reboot();
-                    n_wrong_segment = 0;
-                    n_zero_value_drop_frame = 0;
-                    usleep(750000);
-                    SpiOpenPort(0, spiSpeed);
+                    SpiClosePort(0); lepton_reboot(); n_wrong_segment = 0;
+                    n_zero_value_drop_frame = 0; usleep(750000); SpiOpenPort(0, spiSpeed);
                 }
                 continue;
             }
             if ((typeLepton == 3) && (packetNumber == 20)) {
                 segmentNumber = (result[j*PACKET_SIZE] >> 4) & 0x0f;
-                if ((segmentNumber < 1) || (4 < segmentNumber)) {
-                    // log_message(10, "[ERROR] Wrong segment number " + std::to_string(segmentNumber));
-                    break;
-                }
+                if ((segmentNumber < 1) || (4 < segmentNumber)) break;
             }
-        }
-        if(resets >= 30) {
-            // log_message(3, "done reading, resets: " + std::to_string(resets));
         }
 
         // --- 3. SEGMENT HANDLING ---
         int iSegmentStart = 1;
         int iSegmentStop;
         if (typeLepton == 3) {
-            if ((segmentNumber < 1) || (4 < segmentNumber)) {
-                n_wrong_segment++;
-                continue;
-            }
-            if (n_wrong_segment != 0) {
-                n_wrong_segment = 0;
-            }
+            if ((segmentNumber < 1) || (4 < segmentNumber)) { n_wrong_segment++; continue; }
+            n_wrong_segment = 0;
             memcpy(shelf[segmentNumber - 1], result, sizeof(uint8_t) * PACKET_SIZE*PACKETS_PER_FRAME);
-            if (segmentNumber != 4) {
-                continue;
-            }
+            if (segmentNumber != 4) continue;
             iSegmentStop = 4;
-        }
-        else {
+        } else {
             memcpy(shelf[0], result, sizeof(uint8_t) * PACKET_SIZE*PACKETS_PER_FRAME);
             iSegmentStop = 1;
         }
 
         // --- 4. EXTRACT RAW DATA AND SEND TO PYTHON ---
-        // This loop extracts the real temperature values from the camera packets
         for(int iSegment = iSegmentStart; iSegment <= iSegmentStop; iSegment++) {
             for(int i=0;i<FRAME_SIZE_UINT16;i++) {
-                if(i % PACKET_SIZE_UINT16 < 2) {
-                    continue; // Skip headers
-                }
-
-                // Combine 2 bytes into 1 uint16 value
+                if(i % PACKET_SIZE_UINT16 < 2) continue;
                 uint16_t val = (shelf[iSegment - 1][i*2] << 8) + shelf[iSegment - 1][i*2+1];
-                
                 if (val == 0) continue;
 
-                // Calculate where this pixel belongs in the 160x120 grid
                 int col, row;
                 if (typeLepton == 3) {
                     col = (i % PACKET_SIZE_UINT16) - 2 + (myImageWidth / 2) * ((i % (PACKET_SIZE_UINT16 * 2)) / PACKET_SIZE_UINT16);
@@ -210,27 +211,19 @@ void LeptonThread::run()
                     col = (i % PACKET_SIZE_UINT16) - 2;
                     row = i / PACKET_SIZE_UINT16;
                 }
-
-                // Verify we are inside the image bounds
                 if(row >= 0 && row < myImageHeight && col >= 0 && col < myImageWidth) {
-                     // Store in our buffer
                      rawValuesBuffer[row * myImageWidth + col] = val;
                 }
             }
         }
 
-        // SEND TO PYTHON
         sendto(sockfd, (const char*)rawValuesBuffer.data(), 
                rawValuesBuffer.size() * sizeof(uint16_t), 
-               0, (const struct sockaddr *) &servaddr,  
-               sizeof(servaddr));
-        // ----------------------------------------------
+               0, (const struct sockaddr *) &destaddr, sizeof(destaddr));
 
-
-        // --- 5. UPDATE DEBUG WINDOW (OPTIONAL) ---
-        // Standard color mapping for the C++ Window
+        // --- 5. UPDATE DEBUG WINDOW (Original Logic Kept) ---
         if ((autoRangeMin == true) || (autoRangeMax == true)) {
-            if (autoRangeMin == true) maxValue = 65535;
+            if (autoRangeMin == true) minValue = 65535;
             if (autoRangeMax == true) maxValue = 0;
             for(int iSegment = iSegmentStart; iSegment <= iSegmentStop; iSegment++) {
                 for(int i=0;i<FRAME_SIZE_UINT16;i++) {
@@ -245,9 +238,9 @@ void LeptonThread::run()
             scale = 255/diff;
         }
 
-        int row, column;
-        uint16_t value;
-        QRgb color;
+        int d_row, d_column;
+        uint16_t d_value;
+        QRgb d_color;
         for(int iSegment = iSegmentStart; iSegment <= iSegmentStop; iSegment++) {
             int ofsRow = 30 * (iSegment - 1);
             for(int i=0;i<FRAME_SIZE_UINT16;i++) {
@@ -255,29 +248,26 @@ void LeptonThread::run()
                 uint16_t valueFrameBuffer = (shelf[iSegment - 1][i*2] << 8) + shelf[iSegment - 1][i*2+1];
                 if (valueFrameBuffer == 0) continue;
                 
-                value = (valueFrameBuffer - minValue) * scale;
-                int ofs_r = 3 * value + 0; if (colormapSize <= ofs_r) ofs_r = colormapSize - 1;
-                int ofs_g = 3 * value + 1; if (colormapSize <= ofs_g) ofs_g = colormapSize - 1;
-                int ofs_b = 3 * value + 2; if (colormapSize <= ofs_b) ofs_b = colormapSize - 1;
-                color = qRgb(colormap[ofs_r], colormap[ofs_g], colormap[ofs_b]);
+                d_value = (valueFrameBuffer - minValue) * scale;
+                int ofs_r = 3 * d_value + 0; if (colormapSize <= ofs_r) ofs_r = colormapSize - 1;
+                int ofs_g = 3 * d_value + 1; if (colormapSize <= ofs_g) ofs_g = colormapSize - 1;
+                int ofs_b = 3 * d_value + 2; if (colormapSize <= ofs_b) ofs_b = colormapSize - 1;
+                d_color = qRgb(colormap[ofs_r], colormap[ofs_g], colormap[ofs_b]);
                 
                 if (typeLepton == 3) {
-                    column = (i % PACKET_SIZE_UINT16) - 2 + (myImageWidth / 2) * ((i % (PACKET_SIZE_UINT16 * 2)) / PACKET_SIZE_UINT16);
-                    row = i / PACKET_SIZE_UINT16 / 2 + ofsRow;
+                    d_column = (i % PACKET_SIZE_UINT16) - 2 + (myImageWidth / 2) * ((i % (PACKET_SIZE_UINT16 * 2)) / PACKET_SIZE_UINT16);
+                    d_row = i / PACKET_SIZE_UINT16 / 2 + ofsRow;
+                } else {
+                    d_column = (i % PACKET_SIZE_UINT16) - 2;
+                    d_row = i / PACKET_SIZE_UINT16;
                 }
-                else {
-                    column = (i % PACKET_SIZE_UINT16) - 2;
-                    row = i / PACKET_SIZE_UINT16;
-                }
-                myImage.setPixel(column, row, color);
+                myImage.setPixel(d_column, d_row, d_color);
             }
         }
         emit updateImage(myImage);
     }
-    
     SpiClosePort(0);
 }
-
 void LeptonThread::performFFC() {
     lepton_perform_ffc();
 }
